@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Infinite Map Drawing Tool (Advanced)</title>
+    <style>
+        html, body { margin: 0; padding: 0; height: 100%; }
+        #mapContainer {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; width: 100vw; height: 100vh;
+            background: rgba(30,30,30,0.95);
+            z-index: 1000;
+            cursor: crosshair;
+            user-select: none;
+        }
+        #toolbar {
+            position: absolute;
+            top: 20px; left: 20px;
+            background: #fff;
+            padding: 12px 16px;
+            border-radius: 10px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+            display: flex;
+            gap: 10px;
+            z-index: 1001;
+            align-items: center;
+        }
+        .tool-btn {
+            width: 28px; height: 28px;
+            border: 1.5px solid #ccc;
+            border-radius: 5px;
+            background: #eee;
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 18px;
+        }
+        .tool-btn.selected {
+            border: 2px solid #0078d7;
+            background: #cce4ff;
+        }
+        #brushSize, #eraserSize {
+            width: 60px;
+        }
+        #saveBtn {
+            background: #0078d7;
+            color: #fff;
+            border: none;
+            border-radius: 5px;
+            padding: 6px 14px;
+            font-weight: bold;
+            cursor: pointer;
+            margin-left: 10px;
+        }
+        #saveBtn:hover { background: #005fa3; }
+        #zoomLevel {
+            font-size: 13px;
+            color: #333;
+            margin-left: 8px;
+            min-width: 60px;
+        }
+    </style>
+</head>
+<body>
+<div id="mapContainer">
+    <div id="toolbar">
+        <button class="tool-btn selected" id="brushBtn" title="Brush">🖌️</button>
+        <input type="color" id="colorPicker" value="#ff0000" title="Brush Color">
+        <input type="range" id="brushSize" min="2" max="64" value="8" title="Brush Size">
+        <button class="tool-btn" id="eraserBtn" title="Eraser">🧽</button>
+        <input type="range" id="eraserSize" min="4" max="64" value="16" title="Eraser Size">
+        <button class="tool-btn" id="panBtn" title="Pan/Move">✋</button>
+        <button class="tool-btn" id="undoBtn" title="Undo">↩️</button>
+        <button class="tool-btn" id="redoBtn" title="Redo">↪️</button>
+        <button id="saveBtn" title="Save as PNG">Save</button>
+        <span id="zoomLevel">100%</span>
+    </div>
+    <canvas id="mapCanvas" width="1600" height="900" style="background:#fff;position:absolute;top:0;left:0;"></canvas>
+</div>
+<script>
+const TILE_SIZE = 512; // px
+const TILE_GRID = new Map(); // key: "x,y", value: {canvas,ctx,dirty}
+const DRAWN_TILES = new Set(); // for save/export
+const UNDO_STACK = [];
+const REDO_STACK = [];
+const MAX_UNDO = 50;
+
+const mapContainer = document.getElementById('mapContainer');
+const mapCanvas = document.getElementById('mapCanvas');
+const ctx = mapCanvas.getContext('2d');
+const toolbar = document.getElementById('toolbar');
+const brushBtn = document.getElementById('brushBtn');
+const eraserBtn = document.getElementById('eraserBtn');
+const panBtn = document.getElementById('panBtn');
+const undoBtn = document.getElementById('undoBtn');
+const redoBtn = document.getElementById('redoBtn');
+const colorPicker = document.getElementById('colorPicker');
+const brushSize = document.getElementById('brushSize');
+const eraserSize = document.getElementById('eraserSize');
+const saveBtn = document.getElementById('saveBtn');
+const zoomLevel = document.getElementById('zoomLevel');
+
+let tool = 'brush';
+let drawing = false, panning = false;
+let lastX = 0, lastY = 0;
+let viewX = 0, viewY = 0; // world coords of viewport top-left
+let startPanX = 0, startPanY = 0, startViewX = 0, startViewY = 0;
+let scale = 1;
+
+function tileKey(tx, ty) { return `${tx},${ty}`; }
+function getTile(tx, ty) {
+    const key = tileKey(tx, ty);
+    if (!TILE_GRID.has(key)) {
+        const tileCanvas = document.createElement('canvas');
+        tileCanvas.width = TILE_SIZE;
+        tileCanvas.height = TILE_SIZE;
+        const tileCtx = tileCanvas.getContext('2d');
+        TILE_GRID.set(key, {canvas: tileCanvas, ctx: tileCtx, dirty: false});
+    }
+    return TILE_GRID.get(key);
+}
+function markTileDrawn(tx, ty) {
+    DRAWN_TILES.add(tileKey(tx, ty));
+}
+function worldToScreen(wx, wy) {
+    return [(wx - viewX) * scale, (wy - viewY) * scale];
+}
+function screenToWorld(sx, sy) {
+    return [sx / scale + viewX, sy / scale + viewY];
+}
+function getPointerWorld(e) {
+    const rect = mapCanvas.getBoundingClientRect();
+    const sx = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+    const sy = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
+    return screenToWorld(sx, sy);
+}
+function drawStrokeOnTiles(points, color, size, mode) {
+    // points: [{x,y}, ...]
+    // mode: 'brush' or 'eraser'
+    const affectedTiles = new Set();
+    for (let i = 1; i < points.length; ++i) {
+        const p0 = points[i-1], p1 = points[i];
+        // Find all tiles the segment crosses
+        const minX = Math.floor(Math.min(p0.x, p1.x) / TILE_SIZE);
+        const maxX = Math.floor(Math.max(p0.x, p1.x) / TILE_SIZE);
+        const minY = Math.floor(Math.min(p0.y, p1.y) / TILE_SIZE);
+        const maxY = Math.floor(Math.max(p0.y, p1.y) / TILE_SIZE);
+        for (let tx = minX; tx <= maxX; ++tx) {
+            for (let ty = minY; ty <= maxY; ++ty) {
+                const tile = getTile(tx, ty);
+                tile.ctx.save();
+                tile.ctx.globalCompositeOperation = (mode === 'eraser') ? 'destination-out' : 'source-over';
+                tile.ctx.strokeStyle = (mode === 'brush') ? color : '#000';
+                tile.ctx.lineWidth = size;
+                tile.ctx.lineCap = 'round';
+                tile.ctx.beginPath();
+                tile.ctx.moveTo(p0.x - tx*TILE_SIZE, p0.y - ty*TILE_SIZE);
+                tile.ctx.lineTo(p1.x - tx*TILE_SIZE, p1.y - ty*TILE_SIZE);
+                tile.ctx.stroke();
+                tile.ctx.restore();
+                tile.dirty = true;
+                markTileDrawn(tx, ty);
+                affectedTiles.add(tileKey(tx, ty));
+            }
+        }
+    }
+    return Array.from(affectedTiles);
+}
+function saveUndo() {
+    if (UNDO_STACK.length >= MAX_UNDO) UNDO_STACK.shift();
+    // Save only drawn tiles for efficiency
+    const snapshot = {};
+    for (const key of DRAWN_TILES) {
+        const {canvas} = TILE_GRID.get(key);
+        snapshot[key] = canvas.toDataURL();
+    }
+    UNDO_STACK.push(snapshot);
+    REDO_STACK.length = 0;
+}
+function restoreSnapshot(snapshot) {
+    for (const key of DRAWN_TILES) {
+        if (snapshot[key]) {
+            const img = new window.Image();
+            img.src = snapshot[key];
+            img.onload = () => {
+                const {ctx} = getTile(...key.split(',').map(Number));
+                ctx.clearRect(0,0,TILE_SIZE,TILE_SIZE);
+                ctx.drawImage(img,0,0);
+                TILE_GRID.get(key).dirty = true;
+            };
+        } else {
+            // Clear tile
+            const {ctx} = getTile(...key.split(',').map(Number));
+            ctx.clearRect(0,0,TILE_SIZE,TILE_SIZE);
+            TILE_GRID.get(key).dirty = true;
+        }
+    }
+}
+function undo() {
+    if (UNDO_STACK.length === 0) return;
+    const snapshot = UNDO_STACK.pop();
+    // Save current state to redo
+    const current = {};
+    for (const key of DRAWN_TILES) {
+        const {canvas} = TILE_GRID.get(key);
+        current[key] = canvas.toDataURL();
+    }
+    REDO_STACK.push(current);
+    restoreSnapshot(snapshot);
+    redraw();
+}
+function redo() {
+    if (REDO_STACK.length === 0) return;
+    const snapshot = REDO_STACK.pop();
+    // Save current state to undo
+    saveUndo();
+    restoreSnapshot(snapshot);
+    redraw();
+}
+function redraw() {
+    ctx.clearRect(0,0,mapCanvas.width,mapCanvas.height);
+    // Find visible tiles
+    const left = Math.floor(viewX / TILE_SIZE);
+    const top = Math.floor(viewY / TILE_SIZE);
+    const right = Math.floor((viewX + mapCanvas.width/scale) / TILE_SIZE);
+    const bottom = Math.floor((viewY + mapCanvas.height/scale) / TILE_SIZE);
+    for (let tx = left-1; tx <= right+1; ++tx) {
+        for (let ty = top-1; ty <= bottom+1; ++ty) {
+            const key = tileKey(tx, ty);
+            if (TILE_GRID.has(key)) {
+                const {canvas} = TILE_GRID.get(key);
+                const [sx, sy] = worldToScreen(tx*TILE_SIZE, ty*TILE_SIZE);
+                ctx.drawImage(canvas, sx, sy, TILE_SIZE*scale, TILE_SIZE*scale);
+            }
+        }
+    }
+}
+function resizeCanvas() {
+    mapCanvas.width = window.innerWidth;
+    mapCanvas.height = window.innerHeight;
+    redraw();
+}
+window.addEventListener('resize', resizeCanvas);
+
+// --- UI/Tool logic ---
+function selectTool(newTool) {
+    tool = newTool;
+    [brushBtn, eraserBtn, panBtn].forEach(btn => btn.classList.remove('selected'));
+    if (tool === 'brush') brushBtn.classList.add('selected');
+    if (tool === 'eraser') eraserBtn.classList.add('selected');
+    if (tool === 'pan') panBtn.classList.add('selected');
+    mapContainer.style.cursor = (tool === 'pan') ? 'grab' : 'crosshair';
+}
+brushBtn.onclick = () => selectTool('brush');
+eraserBtn.onclick = () => selectTool('eraser');
+panBtn.onclick = () => selectTool('pan');
+undoBtn.onclick = undo;
+redoBtn.onclick = redo;
+
+// --- Drawing/Panning/Zooming ---
+let strokePoints = [];
+mapCanvas.addEventListener('mousedown', (e) => {
+    if (e.button === 1 || tool === 'pan') {
+        panning = true;
+        startPanX = e.clientX;
+        startPanY = e.clientY;
+        startViewX = viewX;
+        startViewY = viewY;
+        mapContainer.style.cursor = 'grabbing';
+        return;
+    }
+    if (tool === 'brush' || tool === 'eraser') {
+        drawing = true;
+        strokePoints = [];
+        const [wx, wy] = getPointerWorld(e);
+        strokePoints.push({x: wx, y: wy});
+        lastX = wx; lastY = wy;
+        saveUndo();
+    }
+});
+mapCanvas.addEventListener('mousemove', (e) => {
+    if (panning) {
+        viewX = startViewX - (e.clientX - startPanX) / scale;
+        viewY = startViewY - (e.clientY - startPanY) / scale;
+        redraw();
+        return;
+    }
+    if (drawing && (tool === 'brush' || tool === 'eraser')) {
+        const [wx, wy] = getPointerWorld(e);
+        strokePoints.push({x: wx, y: wy});
+        drawStrokeOnTiles(
+            [strokePoints[strokePoints.length-2], strokePoints[strokePoints.length-1]],
+            colorPicker.value,
+            tool === 'brush' ? brushSize.value : eraserSize.value,
+            tool
+        );
+        redraw();
+        lastX = wx; lastY = wy;
+    }
+});
+mapCanvas.addEventListener('mouseup', (e) => {
+    if (panning) {
+        panning = false;
+        mapContainer.style.cursor = 'grab';
+        return;
+    }
+    if (drawing && strokePoints.length > 1) {
+        drawStrokeOnTiles(strokePoints, colorPicker.value, tool === 'brush' ? brushSize.value : eraserSize.value, tool);
+        redraw();
+    }
+    drawing = false;
+    strokePoints = [];
+});
+mapCanvas.addEventListener('mouseleave', () => {
+    drawing = false;
+    panning = false;
+    strokePoints = [];
+    mapContainer.style.cursor = (tool === 'pan') ? 'grab' : 'crosshair';
+});
+mapCanvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const mouse = getPointerWorld(e);
+    let newScale = scale * (e.deltaY < 0 ? 1.1 : 0.9);
+    newScale = Math.max(0.1, Math.min(4, newScale));
+    // Zoom to mouse position
+    viewX = mouse[0] - (e.clientX - mapCanvas.getBoundingClientRect().left) / newScale;
+    viewY = mouse[1] - (e.clientY - mapCanvas.getBoundingClientRect().top) / newScale;
+    scale = newScale;
+    zoomLevel.textContent = Math.round(scale*100) + '%';
+    redraw();
+}, {passive: false});
+
+// Touch support
+mapCanvas.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+        panning = true;
+        startPanX = (e.touches[0].clientX + e.touches[1].clientX)/2;
+        startPanY = (e.touches[0].clientY + e.touches[1].clientY)/2;
+        startViewX = viewX;
+        startViewY = viewY;
+    } else if (e.touches.length === 1 && (tool === 'brush' || tool === 'eraser')) {
+        drawing = true;
+        strokePoints = [];
+        const [wx, wy] = getPointerWorld(e);
+        strokePoints.push({x: wx, y: wy});
+        lastX = wx; lastY = wy;
+        saveUndo();
+    }
+});
+mapCanvas.addEventListener('touchmove', (e) => {
+    if (panning && e.touches.length === 2) {
+        const panX = (e.touches[0].clientX + e.touches[1].clientX)/2;
+        const panY = (e.touches[0].clientY + e.touches[1].clientY)/2;
+        viewX = startViewX - (panX - startPanX) / scale;
+        viewY = startViewY - (panY - startPanY) / scale;
+        redraw();
+    } else if (drawing && e.touches.length === 1 && (tool === 'brush' || tool === 'eraser')) {
+        const [wx, wy] = getPointerWorld(e);
+        strokePoints.push({x: wx, y: wy});
+        drawStrokeOnTiles(
+            [strokePoints[strokePoints.length-2], strokePoints[strokePoints.length-1]],
+            colorPicker.value,
+            tool === 'brush' ? brushSize.value : eraserSize.value,
+            tool
+        );
+        redraw();
+        lastX = wx; lastY = wy;
+    }
+});
+mapCanvas.addEventListener('touchend', (e) => {
+    if (panning) panning = false;
+    if (drawing && strokePoints.length > 1) {
+        drawStrokeOnTiles(strokePoints, colorPicker.value, tool === 'brush' ? brushSize.value : eraserSize.value, tool);
+        redraw();
+    }
+    drawing = false;
+    strokePoints = [];
+});
+
+// --- Save as PNG (only drawn area) ---
+saveBtn.onclick = () => {
+    if (DRAWN_TILES.size === 0) return;
+    // Find bounds
+    let minTx = Infinity, minTy = Infinity, maxTx = -Infinity, maxTy = -Infinity;
+    for (const key of DRAWN_TILES) {
+        const [tx, ty] = key.split(',').map(Number);
+        minTx = Math.min(minTx, tx);
+        minTy = Math.min(minTy, ty);
+        maxTx = Math.max(maxTx, tx);
+        maxTy = Math.max(maxTy, ty);
+    }
+    // Find non-empty area within tiles
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let tx = minTx; tx <= maxTx; ++tx) {
+        for (let ty = minTy; ty <= maxTy; ++ty) {
+            const key = tileKey(tx, ty);
+            if (!DRAWN_TILES.has(key)) continue;
+            const {canvas, ctx: tctx} = getTile(tx, ty);
+            const imgData = tctx.getImageData(0,0,TILE_SIZE,TILE_SIZE).data;
+            let found = false;
+            for (let y = 0; y < TILE_SIZE && !found; ++y) {
+                for (let x = 0; x < TILE_SIZE; ++x) {
+                    if (imgData[(y*TILE_SIZE+x)*4+3] !== 0) {
+                        minX = Math.min(minX, tx*TILE_SIZE + x);
+                        minY = Math.min(minY, ty*TILE_SIZE + y);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            found = false;
+            for (let y = TILE_SIZE-1; y >= 0 && !found; --y) {
+                for (let x = TILE_SIZE-1; x >= 0; --x) {
+                    if (imgData[(y*TILE_SIZE+x)*4+3] !== 0) {
+                        maxX = Math.max(maxX, tx*TILE_SIZE + x);
+                        maxY = Math.max(maxY, ty*TILE_SIZE + y);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (minX > maxX || minY > maxY) return;
+    const w = maxX-minX+1, h = maxY-minY+1;
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = w;
+    exportCanvas.height = h;
+    const exportCtx = exportCanvas.getContext('2d');
+    for (let tx = minTx; tx <= maxTx; ++tx) {
+        for (let ty = minTy; ty <= maxTy; ++ty) {
+            const key = tileKey(tx, ty);
+            if (!DRAWN_TILES.has(key)) continue;
+            const {canvas} = getTile(tx, ty);
+            exportCtx.drawImage(
+                canvas,
+                0, 0, TILE_SIZE, TILE_SIZE,
+                tx*TILE_SIZE-minX, ty*TILE_SIZE-minY, TILE_SIZE, TILE_SIZE
+            );
+        }
+    }
+    const link = document.createElement('a');
+    link.download = 'map.png';
+    link.href = exportCanvas.toDataURL();
+    link.click();
+};
+
+// --- Map show/hide logic ---
+document.addEventListener('keydown', (e) => {
+    if (e.key.toLowerCase() === 'q') {
+        if (mapContainer.style.display === 'none') {
+            mapContainer.style.display = 'block';
+            resizeCanvas();
+            redraw();
+        } else {
+            mapContainer.style.display = 'none';
+        }
+    }
+});
+mapContainer.addEventListener('click', (e) => {
+    if (e.target === mapContainer) mapContainer.style.display = 'none';
+});
+toolbar.addEventListener('click', e => e.stopPropagation());
+mapCanvas.addEventListener('click', e => e.stopPropagation());
+
+// Prevent scrolling when map is open
+mapContainer.addEventListener('wheel', e => e.preventDefault(), { passive: false });
+
+// Init
+resizeCanvas();
+zoomLevel.textContent = Math.round(scale*100) + '%';
+selectTool('brush');
+</script>
+</body>
+</html>
