@@ -178,8 +178,6 @@ let lastX = 0, lastY = 0;
 let viewX = 0, viewY = 0; // world coords of viewport top-left
 let startPanX = 0, startPanY = 0, startViewX = 0, startViewY = 0;
 let scale = 1;
-let isSpacePanning = false;
-let isRightMousePanning = false;
 
 function tileKey(tx, ty) { return `${tx},${ty}`; }
 function getTile(tx, ty) {
@@ -334,41 +332,57 @@ redoBtn.onclick = redo;
 // --- Drawing/Panning/Zooming ---
 let strokePoints = [];
 mapCanvas.addEventListener('mousedown', (e) => {
-    if (e.button === 2 || isSpacePanning) { // right mouse or space
-        isRightMousePanning = true;
+    if (e.button === 1 || tool === 'pan') {
         panning = true;
         startPanX = e.clientX;
         startPanY = e.clientY;
         startViewX = viewX;
         startViewY = viewY;
         mapContainer.style.cursor = 'grabbing';
-    } else if (tool === 'brush' || tool === 'eraser') {
+        return;
+    }
+    if (tool === 'brush' || tool === 'eraser') {
         drawing = true;
         strokePoints = [];
         const [wx, wy] = getPointerWorld(e);
         strokePoints.push({x: wx, y: wy});
+        lastX = wx; lastY = wy;
+        saveUndo();
     }
 });
 mapCanvas.addEventListener('mousemove', (e) => {
-    if (panning && (isRightMousePanning || isSpacePanning)) {
-        const dx = (e.clientX - startPanX) / scale;
-        const dy = (e.clientY - startPanY) / scale;
-        viewX = startViewX - dx;
-        viewY = startViewY - dy;
+    if (panning) {
+        viewX = startViewX - (e.clientX - startPanX) / scale;
+        viewY = startViewY - (e.clientY - startPanY) / scale;
         redraw();
+        return;
+    }
+    if (drawing && (tool === 'brush' || tool === 'eraser')) {
+        const [wx, wy] = getPointerWorld(e);
+        strokePoints.push({x: wx, y: wy});
+        drawStrokeOnTiles(
+            [strokePoints[strokePoints.length-2], strokePoints[strokePoints.length-1]],
+            colorPicker.value,
+            tool === 'brush' ? brushSize.value : eraserSize.value,
+            tool
+        );
+        redraw();
+        lastX = wx; lastY = wy;
     }
 });
 mapCanvas.addEventListener('mouseup', (e) => {
-    if (isRightMousePanning || isSpacePanning) {
+    if (panning) {
         panning = false;
-        isRightMousePanning = false;
-        mapContainer.style.cursor = isSpacePanning ? 'grab' : 'crosshair';
+        mapContainer.style.cursor = 'grab';
+        return;
+    }
+    if (drawing && strokePoints.length > 1) {
+        drawStrokeOnTiles(strokePoints, colorPicker.value, tool === 'brush' ? brushSize.value : eraserSize.value, tool);
+        redraw();
     }
     drawing = false;
     strokePoints = [];
 });
-// Prevent context menu on right click
-mapCanvas.addEventListener('contextmenu', e => e.preventDefault());
 mapCanvas.addEventListener('mouseleave', () => {
     drawing = false;
     panning = false;
@@ -505,10 +519,6 @@ saveBtn.onclick = () => {
 
 // --- Map show/hide logic ---
 document.addEventListener('keydown', (e) => {
-    if (e.code === 'Space') {
-        isSpacePanning = true;
-        mapContainer.style.cursor = 'grab';
-    }
     if (e.key.toLowerCase() === 'q') {
         if (mapContainer.style.display === 'none') {
             mapContainer.style.display = 'block';
@@ -517,12 +527,6 @@ document.addEventListener('keydown', (e) => {
         } else {
             mapContainer.style.display = 'none';
         }
-    }
-});
-document.addEventListener('keyup', (e) => {
-    if (e.code === 'Space') {
-        isSpacePanning = false;
-        mapContainer.style.cursor = 'crosshair';
     }
 });
 mapContainer.addEventListener('click', (e) => {
